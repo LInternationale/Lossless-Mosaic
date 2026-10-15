@@ -38,4 +38,5 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
       - run: npm run tauri build -- --debug

@@ -420,3 +420,150 @@ fn pixel_masks_encrypt_only_selected_pixels_in_alpha_and_sidecar() {
     )
     .is_err());
 }
+
+#[test]
+fn automatic_selection_finds_small_cipher_blocks_and_ignores_flat_background() {
+    use mosaic_core::{detect_blocks, transform_grid, GridSelection};
+    for bpp in [24, 32] {
+        for size in [8, 16, 32, 64] {
+            let mut src = fixture(128, -128, bpp);
+            let end = src.len() - 9;
+            src[70..end].fill(110);
+            let actual = GridSelection::from_regions(
+                128,
+                128,
+                size,
+                &[Rect {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 64,
+                }],
+            )
+            .unwrap();
+            let encrypted = transform_grid(&src, "detect-fixture", &actual).unwrap();
+            let report = detect_blocks(&encrypted, size).unwrap();
+            assert_eq!(report.selection, actual, "bpp={bpp}, size={size}");
+            assert_eq!(report.uncertain_blocks, 0);
+            let restored = transform_grid(&encrypted, "detect-fixture", &report.selection).unwrap();
+            assert_eq!(restored, src);
+        }
+    }
+}
+#[test]
+fn tiny_edges_are_reported_and_known_remaining_cells_are_safe() {
+    use mosaic_core::{detect_blocks, GridSelection};
+    let report = detect_blocks(&fixture(67, -39, 24), 8).unwrap();
+    assert!(report.uncertain_blocks > 0);
+    let known = GridSelection::from_regions(
+        64,
+        64,
+        16,
+        &[Rect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 16,
+        }],
+    )
+    .unwrap();
+    let selected = GridSelection::from_regions(
+        64,
+        64,
+        16,
+        &[Rect {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+        }],
+    )
+    .unwrap();
+    let remaining = known.without(&selected, 64, 64).unwrap();
+    assert_eq!(
+        remaining.rects(64, 64).unwrap(),
+        vec![Rect {
+            x: 16,
+            y: 0,
+            width: 16,
+            height: 16
+        }]
+    );
+    assert!(known
+        .without(
+            &GridSelection::from_regions(
+                64,
+                64,
+                16,
+                &[Rect {
+                    x: 48,
+                    y: 48,
+                    width: 16,
+                    height: 16
+                }]
+            )
+            .unwrap(),
+            64,
+            64
+        )
+        .is_err());
+    assert!(known
+        .without(&GridSelection::empty(64, 64, 8).unwrap(), 64, 64)
+        .is_err());
+}
+#[test]
+fn encryption_preview_warns_on_noise_overlap_without_changing_candidate() {
+    use mosaic_core::{assess_encryption, transform_grid, GridSelection};
+    let mut src = fixture(128, -128, 24);
+    let end = src.len() - 9;
+    src[70..end].fill(70);
+    let selected = GridSelection::from_regions(
+        128,
+        128,
+        8,
+        &[Rect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        }],
+    )
+    .unwrap();
+    let cipher = transform_grid(&src, "preview", &selected).unwrap();
+    let before = cipher.clone();
+    let good = assess_encryption(&cipher, &selected).unwrap();
+    assert!(!good.warning);
+    assert_eq!(good.entropy_auc, Some(1.0));
+    assert_eq!(good.missed_blocks, 0);
+    assert_eq!(cipher, before);
+    // Unselected tiles already look encrypted: entropy cannot distinguish them from new ciphertext.
+    let all = GridSelection::from_regions(
+        128,
+        128,
+        8,
+        &[Rect {
+            x: 0,
+            y: 0,
+            width: 128,
+            height: 128,
+        }],
+    )
+    .unwrap();
+    let noisy = transform_grid(&src, "existing-noise", &all).unwrap();
+    let candidate = transform_grid(&noisy, "preview", &selected).unwrap();
+    let poor = assess_encryption(&candidate, &selected).unwrap();
+    assert!(poor.warning);
+    assert!(poor.entropy_auc.unwrap() < 0.8);
+    assert!(poor.false_positive_blocks > 0);
+    // The warning is advisory: encryption and correct selective decryption remain possible.
+    assert_eq!(
+        transform_grid(&candidate, "preview", &selected).unwrap(),
+        noisy
+    );
+    assert!(assess_encryption(&cipher, &all).unwrap().warning);
+    assert!(
+        !assess_encryption(&src, &GridSelection::empty(128, 128, 8).unwrap())
+            .unwrap()
+            .warning
+    );
+}

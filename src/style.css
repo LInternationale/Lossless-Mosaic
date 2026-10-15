@@ -832,3 +832,27 @@ aside {
     padding: 6px;
   }
 }
+#preview {
+  margin-bottom: 9px;
+  justify-content: center;
+}
+#preview-summary {
+  white-space: pre-wrap;
+  font: 9px/1.65 inherit;
+  font-family: inherit;
+  font-size: 9px;
+  line-height: 1.65;
+  margin: 0 0 10px;
+  padding: 8px;
+  color: #b6d39e;
+  background: #172214;
+  border: 1px solid #435e34;
+  border-radius: 4px;
+  max-height: 150px;
+  overflow: auto;
+}
+#preview-summary.warning {
+  color: #efc49b;
+  background: #30251a;
+  border-color: #815b38;
+}

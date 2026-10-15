@@ -36,6 +36,31 @@ impl GridSelection {
         }
         Ok(())
     }
+    /// Remove only known encrypted cells; refuse accidental XOR of known plaintext.
+    pub fn without(&self, selected: &Self, width: u32, height: u32) -> Result<Self> {
+        self.validate(width, height)?;
+        selected.validate(width, height)?;
+        if self.block_size != selected.block_size {
+            return Err(Error::Region("解密时须使用加密时相同的区块尺寸"));
+        }
+        if self
+            .bits
+            .iter()
+            .zip(&selected.bits)
+            .any(|(a, b)| b & !a != 0)
+        {
+            return Err(Error::Region("选区包含未加密区块，请用取消解密移除"));
+        }
+        Ok(Self {
+            block_size: self.block_size,
+            bits: self
+                .bits
+                .iter()
+                .zip(&selected.bits)
+                .map(|(a, b)| a & !b)
+                .collect(),
+        })
+    }
     pub fn is_empty(&self) -> bool {
         self.bits.iter().all(|v| *v == 0)
     }

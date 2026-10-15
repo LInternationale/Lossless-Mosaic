@@ -109,3 +109,40 @@ test("round pixel brush and overlapping erase preserve unpainted pixels", () => 
   m.pixelStroke(v.image(p), v.image(p), 1, true);
   assert.ok(m.has(50 * 64 + 40));
 });
+
+test("block restore keeps decryption tools after partial application", async () => {
+  const { brushLabels, nextOperation } =
+    await import("../artifacts/test-ui/editor-state.js");
+  const operation = nextOperation("restore", true);
+  assert.equal(operation, "restore");
+  const labels = brushLabels(operation === "restore", true);
+  assert.equal(labels.paint, "解密");
+  assert.equal(labels.erase, "取消解密");
+  const mask = new GridMask(64, 64, 16);
+  mask.set(0, true);
+  mask.set(1, true);
+  const before = mask.clone();
+  mask.stroke({ x: 1, y: 1 }, { x: 1, y: 1 }, 1, false);
+  assert.equal(mask.has(0), false);
+  assert.equal(mask.has(1), true);
+  assert.equal(before.count, 2);
+  assert.equal(nextOperation("restore", false), "protect");
+  assert.equal(brushLabels(false, true).paint, "打码");
+});
+test("preview explains warnings without disabling intentional continuation", async () => {
+  const { previewText } = await import("../artifacts/test-ui/editor-state.js");
+  const text = previewText({
+    encrypted_blocks: 2,
+    plain_blocks: 8,
+    encrypted_entropy: { min: 6.8, max: 7.1, mean: 7 },
+    plain_entropy: { min: 6.7, max: 7.1, mean: 6.9 },
+    entropy_auc: 0.55,
+    missed_blocks: 1,
+    false_positive_blocks: 3,
+    uncertain_blocks: 1,
+    warning: true,
+  });
+  assert.match(text, /55.0%/);
+  assert.match(text, /误选 3/);
+  assert.match(text, /漏选 1/);
+});

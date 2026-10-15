@@ -345,31 +345,7 @@ pub fn transform_grid(bytes: &[u8], password: &str, selection: &GridSelection) -
     Ok(b.bytes)
 }
 pub fn suggest_grid(bytes: &[u8], block_size: u32) -> Result<GridSelection> {
-    if block_size == 1 {
-        return Err(Error::Region("信息熵检测仅限区块模式"));
-    }
-    let b = Bitmap::parse(bytes.to_vec())?;
-    let mut selection = GridSelection::empty(b.width, b.height, block_size)?;
-    let cols = b.width.div_ceil(block_size);
-    let rows = b.height.div_ceil(block_size);
-    // Normalize the empirical entropy threshold by the finite sample maximum.
-    for y in 0..rows {
-        for x in 0..cols {
-            let r = Rect {
-                x: x * block_size,
-                y: y * block_size,
-                width: block_size.min(b.width - x * block_size),
-                height: block_size.min(b.height - y * block_size),
-            };
-            let data = b.read(r);
-            let threshold = 7.6_f64.min((data.len() as f64).log2() * 0.94);
-            if entropy(&data) > threshold {
-                let i = (y * cols + x) as usize;
-                selection.bits[i / 8] |= 1 << (i % 8);
-            }
-        }
-    }
-    Ok(selection)
+    Ok(crate::detect_blocks(bytes, block_size)?.selection)
 }
 fn grid_aad(mode: Mode) -> Vec<u8> {
     format!("lossless-mosaic/grid/v2/{mode:?}").into_bytes()

@@ -2,7 +2,9 @@
 mod application;
 mod bmp;
 mod crypto;
+mod detection;
 mod domain;
+pub use detection::{assess_encryption, detect_blocks, BlockSuggestions, EncryptionPreview};
 mod envelope;
 mod selection;
 pub use selection::GridSelection;

@@ -2,6 +2,12 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { GridMask, type Selection, type Point } from "./grid";
 import { ImageViewport } from "./viewport";
 import "./style.css";
+import {
+  brushLabels,
+  nextOperation,
+  previewText,
+  type PreviewReport,
+} from "./editor-state";
 type Mode = "alpha" | "entropy" | "sidecar";
 type Tool = "paint" | "erase" | "hand";
 type View = {
@@ -61,7 +67,7 @@ document.querySelector("#app")!.innerHTML = `
 <div class="setting-row" id="block-settings"><label for="block-size">区块尺寸</label><select id="block-size"><option value="8">8 × 8 · 密</option><option value="16">16 × 16</option><option value="32" selected>32 × 32</option><option value="64">64 × 64 · 疏</option></select></div>
 <div class="setting-row"><label for="brush-size">笔刷宽度</label><output id="brush-size-label">1 格</output></div><input id="brush-size" aria-label="笔刷宽度" type="range" min="1" max="8" step="1" value="1">
 <p class="mode-note" id="selection-summary">经过即选中，重复涂抹不会反转。</p><div class="selection-info"><span id="selection-title">0 个网格</span><button id="suggest" class="text-button" hidden>熵检测建议</button></div><button id="adopt" class="text-button" hidden>将当前网格记作已有打码</button></section>
-</div><div class="panel-bottom"><button id="apply" class="primary full" disabled>应用打码 <span>→</span></button><p id="action-note">加密后请另存为，源文件不会被覆盖。</p></div></aside></main>
+</div><div class="panel-bottom"><button id="preview" class="button full" hidden>预演加密</button><pre id="preview-summary" hidden></pre><button id="apply" class="primary full" disabled>应用打码 <span>→</span></button><p id="action-note">加密后请另存为，源文件不会被覆盖。</p></div></aside></main>
 <div id="toast" role="alert" hidden></div>`;
 const canvas = $<HTMLCanvasElement>("image"),
   overlay = $<HTMLCanvasElement>("overlay"),
@@ -83,6 +89,7 @@ function pending() {
   return !!mask && !!applied && (!mask.equals(applied) || mode !== appliedMode);
 }
 function remember(before: GridMask) {
+  $("preview-summary").hidden = true;
   if (mask && !mask.equals(before)) {
     undo.push(before);
     if (undo.length > 50) undo.shift();
@@ -211,9 +218,18 @@ new ResizeObserver(() => {
   }
 }).observe(viewport);
 function update() {
-  $("paint").title =
-    mode === "entropy" ? "涂抹选中经过的网格" : "按像素精度涂抹";
-  $("erase").title = mode === "entropy" ? "移除经过的网格" : "按像素精度擦除";
+  const labels = brushLabels(operation === "restore", mode === "entropy");
+  $("paint").textContent = labels.paint;
+  $("erase").textContent = labels.erase;
+  $("paint").title = labels.paintTitle;
+  $("erase").title = labels.eraseTitle;
+  $("preview").hidden = mode !== "entropy" || operation !== "protect";
+  $<HTMLButtonElement>("preview").disabled =
+    busy ||
+    !native ||
+    !doc ||
+    !mask?.count ||
+    !$<HTMLInputElement>("password").value;
   overlay.setAttribute(
     "aria-label",
     mode === "entropy"
@@ -226,6 +242,9 @@ function update() {
   $("tab-protect").classList.toggle("active", operation === "protect");
   $("tab-restore").classList.toggle("active", operation === "restore");
   $("confirm-wrap").hidden = operation === "restore";
+  for (const id of ["password", "confirm", "alpha-consent"])
+    $<HTMLInputElement>(id).disabled = busy;
+  $<HTMLButtonElement>("reveal").disabled = busy;
   for (const t of ["paint", "erase", "hand"] as const) {
     $(t).classList.toggle("active", t === tool);
     $<HTMLButtonElement>(t).disabled =
@@ -248,14 +267,20 @@ function update() {
   );
   $("attach").hidden = operation !== "restore" || mode !== "sidecar";
   $("suggest").hidden = mode !== "entropy" || !doc;
+  $("suggest").textContent =
+    doc?.selection && !doc.mode ? "选择剩余加密块" : "自动选择";
   $("adopt").hidden =
-    mode !== "entropy" || !doc || !!doc.mode || !!doc.selection;
+    mode !== "entropy" ||
+    operation === "restore" ||
+    !doc ||
+    !!doc.mode ||
+    !!doc.selection;
   $<HTMLButtonElement>("adopt").disabled =
     busy || count === 0 || !!assumedBlockMask;
   $("selection-summary").textContent = restoreAll
     ? "完整还原所有加密像素。局部反打码请切换「编辑打码」，用反打码笔刷擦除。"
     : operation === "restore"
-      ? "涂抹需要还原的网格；选择加密时相同的区块尺寸，再应用还原。"
+      ? "解密选择要还原的格子，取消解密移除误选；请使用加密时相同的区块尺寸。"
       : mode === "entropy"
         ? "经过即选中整格，反打码移除整格；重叠涂抹覆盖旧状态。"
         : "像素精度圆形笔刷；打码涂抹，反打码擦除，支持重叠覆盖。";
@@ -312,7 +337,11 @@ function update() {
         !["open", "open-empty", "tab-protect", "tab-restore"].includes(id));
   $<HTMLButtonElement>("undo").disabled = busy || !undo.length;
   $<HTMLButtonElement>("clear").disabled = busy || !count;
-  $<HTMLSelectElement>("block-size").disabled = busy || !doc || restoreAll;
+  $<HTMLSelectElement>("block-size").disabled =
+    busy ||
+    !doc ||
+    restoreAll ||
+    (operation === "restore" && !!doc.selection && !doc.mode);
   $<HTMLInputElement>("brush-size").disabled = busy || !doc;
   document.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach((b) => {
     b.disabled = busy;
@@ -331,6 +360,7 @@ function update() {
 function show(v: View, reset = true) {
   const previous = camera;
   doc = v;
+  $("preview-summary").hidden = true;
   assumedBlockMask = null;
   if (v.mode) mode = v.mode;
   else if (v.selection) mode = "entropy";
@@ -452,19 +482,29 @@ $("suggest").onclick = () =>
   run(async () => {
     if (!mask) return;
     const before = mask;
-    const s = await invoke<Selection>("suggest_blocks", {
-      blockSize: mask.size,
-    });
+    const report = await invoke<{
+      selection: Selection;
+      uncertain_blocks: number;
+      source: string;
+    }>("suggest_blocks", { blockSize: mask.size });
+    const s = report.selection;
     mask = new GridMask(mask.width, mask.height, s.block_size, s.bits);
     remember(before);
-    notice(`建议 ${mask.count} 个网格，请用打码 / 反打码笔刷修正。`);
+    notice(
+      report.source === "session"
+        ? `已选择本次会话记录的 ${mask.count} 个剩余加密块。`
+        : `自动建议 ${mask.count} 格；样本不足边缘格 ${report.uncertain_blocks} 个需手动检查。请用${operation === "restore" ? "解密 / 取消解密" : "打码 / 反打码"}修正。`,
+    );
   });
 $("tab-protect").onclick = () => {
   operation = "protect";
+  $("preview-summary").hidden = true;
   update();
 };
 $("tab-restore").onclick = () => {
   operation = "restore";
+  $("preview-summary").hidden = true;
+  tool = "paint";
   update();
 };
 for (const t of ["paint", "erase", "hand"] as const)
@@ -477,6 +517,7 @@ document.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach(
     (b.onclick = () => {
       if (mode === b.dataset.mode) return;
       mode = b.dataset.mode as Mode;
+      $("preview-summary").hidden = true;
       if (mask) {
         mask = mask.resized(
           mode === "entropy"
@@ -493,10 +534,16 @@ document.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach(
 $("block-size").onchange = () => {
   if (mask) {
     const before = mask;
-    mask = mask.resized(Number($<HTMLSelectElement>("block-size").value));
+    const size = Number($<HTMLSelectElement>("block-size").value);
+    mask =
+      operation === "restore"
+        ? new GridMask(mask.width, mask.height, size)
+        : mask.resized(size);
     remember(before);
     notice(
-      "网格已重新划分；与旧选区相交的新网格全部选中，应用时重新生成结果。",
+      operation === "restore"
+        ? "解密区块尺寸已更改，旧选区已清空。请按正确尺寸重新自动选择。"
+        : "网格已重新划分；与旧选区相交的新网格全部选中，应用时重新生成结果。",
     );
     update();
   }
@@ -520,25 +567,59 @@ $("reveal").onclick = () => {
   );
   update();
 };
+function displayPreview(report: PreviewReport) {
+  $("preview-summary").hidden = false;
+  $("preview-summary").textContent = previewText(report);
+  $("preview-summary").classList.toggle("warning", report.warning);
+}
+async function preparePreview(): Promise<PreviewReport> {
+  if (!mask) throw new Error("请先打开图片");
+  const report = await invoke<PreviewReport>("preview_blocks", {
+    password: $<HTMLInputElement>("password").value,
+    selection: mask.serialize(),
+    existingSelection: assumedBlockMask?.serialize() ?? null,
+  });
+  displayPreview(report);
+  return report;
+}
+$("preview").onclick = () =>
+  run(async () => {
+    const report = await preparePreview();
+    notice(
+      report.warning
+        ? "预演：区分度不足或存在误选 / 漏选。应用时会提醒，可选择继续加密。"
+        : "预演完成：这次结果的自动选择可区分选中与未选中区块。",
+    );
+  });
 $("apply").onclick = () =>
   run(async () => {
     if (!mask) return;
     try {
-      const v = await invoke<View>("transform", {
-        password: $<HTMLInputElement>("password").value,
-        mode,
-        selection: mask.serialize(),
-        decrypt: operation === "restore",
-        allowAlphaLoss: $<HTMLInputElement>("alpha-consent").checked,
-        existingSelection: assumedBlockMask?.serialize() ?? null,
-      });
+      let v: View;
+      if (mode === "entropy" && operation === "protect") {
+        await preparePreview();
+        const result = await invoke<View | null>("commit_preview");
+        if (!result) {
+          notice("已取消应用加密，当前图片未改变。");
+          return;
+        }
+        v = result;
+      } else
+        v = await invoke<View>("transform", {
+          password: $<HTMLInputElement>("password").value,
+          mode,
+          selection: mask.serialize(),
+          decrypt: operation === "restore",
+          allowAlphaLoss: $<HTMLInputElement>("alpha-consent").checked,
+          existingSelection: assumedBlockMask?.serialize() ?? null,
+        });
       const was = operation;
       dirty = true;
       show(v, false);
-      operation = "protect";
+      operation = nextOperation(was, mode === "entropy");
       notice(
         was === "restore"
-          ? "还原完成，请另存为。"
+          ? "解密已应用，请检查结果并另存为。"
           : "打码 / 反打码已应用，可继续涂抹。请另存为。",
       );
     } finally {
