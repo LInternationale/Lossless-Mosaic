@@ -1,3 +1,4 @@
+use crate::GridSelection;
 use crate::{
     crypto,
     domain::{Error, Mode, Rect, Result, MAX_BYTES, MAX_RECORDS},
@@ -25,6 +26,8 @@ pub(crate) struct Manifest {
     pub records: Vec<Record>,
     pub auth_nonce: [u8; 24],
     pub auth_tag: [u8; 16],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<GridSelection>,
 }
 impl Manifest {
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -36,7 +39,9 @@ impl Manifest {
         }
         let m: Self = serde_json::from_slice(data).map_err(|_| Error::Metadata)?;
         if m.mode == Mode::Entropy
-            || m.version != 1
+            || ![1, 2].contains(&m.version)
+            || (m.version == 1 && m.selection.is_some())
+            || (m.version == 2 && (m.selection.is_none() || m.records.len() != 1))
             || m.records.is_empty()
             || m.records.len() > MAX_RECORDS
             || m.original_len > MAX_BYTES

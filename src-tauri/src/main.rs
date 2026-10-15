@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-use mosaic_core::{Bitmap, Mode, Rect};
+use base64::Engine;
+use mosaic_core::{Bitmap, GridSelection, Mode};
 use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
@@ -16,6 +17,8 @@ struct Document {
     bytes: Vec<u8>,
     sidecar: Option<Vec<u8>>,
     name: String,
+    block_origin: Option<Vec<u8>>,
+    block_selection: Option<GridSelection>,
 }
 #[derive(Default)]
 struct Session(Mutex<Option<Document>>);
@@ -25,36 +28,42 @@ struct View {
     width: u32,
     height: u32,
     bpp: u16,
+    source_bpp: u16,
     mode: Option<Mode>,
-    rgba: Vec<u8>,
+    preview_url: String,
     preview_width: u32,
     preview_height: u32,
-    suggested_blocks: Vec<Rect>,
+    selection: Option<GridSelection>,
 }
 fn view(d: &Document) -> Result<View, String> {
     let i = mosaic_core::inspect(&d.bytes, d.sidecar.as_deref()).map_err(|e| e.to_string())?;
-    let scale = (1600.0 / i.width.max(i.height) as f64).min(1.0);
-    let w = (i.width as f64 * scale).round().max(1.0) as u32;
-    let h = (i.height as f64 * scale).round().max(1.0) as u32;
-    let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
-    for y in 0..h {
-        for x in 0..w {
-            let src = (((y as u64 * i.height as u64 / h as u64) * i.width as u64
-                + x as u64 * i.width as u64 / w as u64)
-                * 4) as usize;
-            rgba.extend_from_slice(&i.rgba[src..src + 4]);
-        }
+    let w = i.width;
+    let h = i.height;
+    let mut png_bytes = vec![];
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+        writer
+            .write_image_data(&i.rgba)
+            .map_err(|e| e.to_string())?;
     }
+    let preview_url = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png_bytes)
+    );
     Ok(View {
         name: d.name.clone(),
         width: i.width,
         height: i.height,
         bpp: i.bpp,
+        source_bpp: i.source_bpp,
         mode: i.mode,
-        rgba,
+        preview_url,
         preview_width: w,
         preview_height: h,
-        suggested_blocks: i.suggested_blocks,
+        selection: d.block_selection.clone().or(i.selection),
     })
 }
 fn read(path: &PathBuf) -> Result<Vec<u8>, String> {
@@ -99,6 +108,8 @@ async fn open_document(app: tauri::AppHandle) -> Result<Option<View>, String> {
             None
         };
         let d = Document {
+            block_origin: None,
+            block_selection: None,
             bytes,
             sidecar,
             name: path
@@ -130,6 +141,8 @@ async fn attach_sidecar(app: tauri::AppHandle) -> Result<Option<View>, String> {
         let mut guard = state.0.lock().map_err(|e| e.to_string())?;
         let d = guard.as_mut().ok_or("请先打开 BMP")?;
         let candidate = Document {
+            block_origin: None,
+            block_selection: None,
             bytes: d.bytes.clone(),
             sidecar: Some(data),
             name: d.name.clone(),
@@ -145,17 +158,31 @@ async fn transform(
     app: tauri::AppHandle,
     password: String,
     mode: Mode,
-    regions: Vec<Rect>,
+    selection: GridSelection,
     decrypt: bool,
+    allow_alpha_loss: bool,
+    existing_selection: Option<GridSelection>,
 ) -> Result<View, String> {
     let password = Zeroizing::new(password);
     blocking(move || {
         let state: State<Session> = app.state();
         let mut guard = state.0.lock().map_err(|e| e.to_string())?;
         let d = guard.as_mut().ok_or("请先打开 BMP")?;
+        let current = Bitmap::parse(d.bytes.clone()).map_err(|e| e.to_string())?;
+        selection
+            .validate(current.width, current.height)
+            .map_err(|e| e.to_string())?;
+        let info =
+            mosaic_core::inspect(&d.bytes, d.sidecar.as_deref()).map_err(|e| e.to_string())?;
         let candidate = if decrypt {
+            if mode == Mode::Entropy && info.mode.is_some() {
+                return Err("这张图片有还原信息，请使用对应模式还原".into());
+            }
             let bytes = if mode == Mode::Entropy {
-                mosaic_core::transform_blocks(&d.bytes, &password, &regions)
+                if selection.is_empty() {
+                    return Err("请先涂抹要还原的网格".into());
+                }
+                mosaic_core::transform_grid(&d.bytes, &password, &selection)
             } else {
                 mosaic_core::restore(&d.bytes, d.sidecar.as_deref(), &password)
             }
@@ -164,26 +191,55 @@ async fn transform(
                 bytes,
                 sidecar: None,
                 name: format!("{}-restored.bmp", d.name.trim_end_matches(".bmp")),
+                block_origin: None,
+                block_selection: None,
             }
         } else {
-            if mosaic_core::inspect(&d.bytes, d.sidecar.as_deref())
-                .map_err(|e| e.to_string())?
-                .mode
-                .is_some()
-            {
-                return Err("请先还原后再重新打码".into());
+            // Edit a target mask against the recovered source, so overlapping strokes never double-XOR.
+            let base = if info.mode.is_some() {
+                mosaic_core::restore(&d.bytes, d.sidecar.as_deref(), &password)
+                    .map_err(|e| e.to_string())?
+            } else {
+                if let Some(origin) = &d.block_origin {
+                    origin.clone()
+                } else if let Some(existing) = &existing_selection {
+                    mosaic_core::transform_grid(&d.bytes, &password, existing)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    d.bytes.clone()
+                }
+            };
+            let source = Bitmap::parse(base.clone()).map_err(|e| e.to_string())?;
+            if mode == Mode::Alpha && source.bpp == 32 && !allow_alpha_loss {
+                return Err("α 模式会覆盖原有透明度，请勾选警告后继续".into());
             }
-            let p = mosaic_core::protect(&d.bytes, &password, mode, &regions)
+            let p = mosaic_core::protect_grid(&base, &password, mode, &selection)
                 .map_err(|e| e.to_string())?;
+            let is_block = mode == Mode::Entropy && !selection.is_empty();
             Document {
                 bytes: p.bitmap,
                 sidecar: p.sidecar,
-                name: format!("{}-protected.bmp", d.name.trim_end_matches(".bmp")),
+                name: format!(
+                    "{}-edited.bmp",
+                    d.name.trim_end_matches(".bmp").trim_end_matches("-edited")
+                ),
+                block_origin: if is_block { Some(base) } else { None },
+                block_selection: if is_block { Some(selection) } else { None },
             }
         };
         let v = view(&candidate)?;
         *d = candidate;
         Ok(v)
+    })
+    .await
+}
+#[tauri::command]
+async fn suggest_blocks(app: tauri::AppHandle, block_size: u32) -> Result<GridSelection, String> {
+    blocking(move || {
+        let state: State<Session> = app.state();
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let d = guard.as_ref().ok_or("请先打开 BMP")?;
+        mosaic_core::suggest_grid(&d.bytes, block_size).map_err(|e| e.to_string())
     })
     .await
 }
@@ -245,6 +301,7 @@ fn main() {
             open_document,
             attach_sidecar,
             transform,
+            suggest_blocks,
             save_document
         ])
         .run(tauri::generate_context!())

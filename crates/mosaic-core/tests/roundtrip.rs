@@ -192,3 +192,231 @@ fn fresh_salts_make_distinct_authenticated_outputs() {
     assert_ne!(a.bitmap, b.bitmap);
     assert!(restore(&a.bitmap, b.sidecar.as_deref(), "pw").is_err());
 }
+
+#[test]
+fn grid_v2_roundtrip_all_sizes_and_more_than_256_cells() {
+    use mosaic_core::{protect_grid, GridSelection};
+    let src = fixture(257, -129, 24);
+    for size in [8, 16, 32, 64] {
+        let selection = GridSelection::from_regions(
+            257,
+            129,
+            size,
+            &[Rect {
+                x: 0,
+                y: 0,
+                width: 257,
+                height: 129,
+            }],
+        )
+        .unwrap();
+        for mode in [Mode::Alpha, Mode::Sidecar] {
+            let p = protect_grid(&src, "grid", mode, &selection).unwrap();
+            let info = inspect(&p.bitmap, p.sidecar.as_deref()).unwrap();
+            assert_eq!(info.selection, Some(selection.clone()));
+            assert_eq!(info.source_bpp, 24);
+            assert_eq!(
+                restore(&p.bitmap, p.sidecar.as_deref(), "grid").unwrap(),
+                src
+            );
+        }
+    }
+}
+#[test]
+fn grid_repaint_and_erase_rebuild_the_target_without_double_xor() {
+    use mosaic_core::{protect_grid, GridSelection};
+    let src = fixture(128, -96, 32);
+    let first = GridSelection::from_regions(
+        128,
+        96,
+        16,
+        &[
+            Rect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            },
+            Rect {
+                x: 16,
+                y: 16,
+                width: 48,
+                height: 48,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(first.rects(128, 96).unwrap().len(), 16);
+    let p = protect_grid(&src, "grid", Mode::Sidecar, &first).unwrap();
+    let mut next = first.clone();
+    next.bits[0] &= !1;
+    next.bits[2] |= 1 << 7;
+    let recovered = restore(&p.bitmap, p.sidecar.as_deref(), "grid").unwrap();
+    let revised = protect_grid(&recovered, "grid", Mode::Sidecar, &next).unwrap();
+    assert_eq!(
+        inspect(&revised.bitmap, revised.sidecar.as_deref())
+            .unwrap()
+            .selection,
+        Some(next)
+    );
+    assert_eq!(&revised.bitmap[70..70 + 16 * 4], &src[70..70 + 16 * 4]);
+    assert_eq!(
+        restore(&revised.bitmap, revised.sidecar.as_deref(), "grid").unwrap(),
+        src
+    );
+    let cleared = protect_grid(
+        &src,
+        "grid",
+        Mode::Sidecar,
+        &GridSelection::empty(128, 96, 16).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cleared.bitmap, src);
+    assert!(cleared.sidecar.is_none());
+    assert!(restore(&p.bitmap, p.sidecar.as_deref(), "wrong").is_err());
+}
+#[test]
+fn variable_grid_blocks_are_metadata_free_and_can_be_partially_erased() {
+    use mosaic_core::{transform_grid, GridSelection};
+    let src = fixture(67, -39, 32);
+    for size in [8, 16, 32, 64] {
+        let old = GridSelection::from_regions(
+            67,
+            39,
+            size,
+            &[Rect {
+                x: 0,
+                y: 0,
+                width: 67,
+                height: 39,
+            }],
+        )
+        .unwrap();
+        let encrypted = transform_grid(&src, "pw", &old).unwrap();
+        assert_eq!(encrypted.len(), src.len());
+        assert_eq!(transform_grid(&encrypted, "pw", &old).unwrap(), src);
+        let erased = GridSelection::from_regions(
+            67,
+            39,
+            size,
+            &[Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+        )
+        .unwrap();
+        let mut target = old.clone();
+        for (a, b) in target.bits.iter_mut().zip(&erased.bits) {
+            *a &= !*b;
+        }
+        let partial = transform_grid(&encrypted, "pw", &erased).unwrap();
+        assert_eq!(partial, transform_grid(&src, "pw", &target).unwrap());
+    }
+}
+#[test]
+fn grid_rejects_invalid_bits_and_tampered_selection() {
+    use mosaic_core::{protect_grid, GridSelection};
+    assert!(GridSelection::empty(u32::MAX, u32::MAX, 8).is_err());
+    assert!(GridSelection {
+        block_size: 7,
+        bits: vec![1]
+    }
+    .validate(32, 32)
+    .is_err());
+    assert!(GridSelection {
+        block_size: 32,
+        bits: vec![0xff]
+    }
+    .validate(32, 32)
+    .is_err());
+    assert!(GridSelection {
+        block_size: 8,
+        bits: vec![]
+    }
+    .validate(32, 32)
+    .is_err());
+    let src = fixture(128, -96, 24);
+    let s = GridSelection::from_regions(128, 96, 16, &[R]).unwrap();
+    let p = protect_grid(&src, "pw", Mode::Sidecar, &s).unwrap();
+    let mut side = p.sidecar.unwrap();
+    let text = String::from_utf8(side[..side.len() - 16].to_vec()).unwrap();
+    let offset = text.find("\"block_size\":16").unwrap() + 13;
+    side[offset] = b'3';
+    assert!(restore(&p.bitmap, Some(&side), "pw").is_err());
+}
+
+#[test]
+fn pixel_masks_encrypt_only_selected_pixels_in_alpha_and_sidecar() {
+    use mosaic_core::{protect_grid, GridSelection};
+    let legacy_source = fixture(129, -67, 24);
+    let legacy = protect(&legacy_source, "legacy", Mode::Sidecar, &[R]).unwrap();
+    let legacy_mask = inspect(&legacy.bitmap, legacy.sidecar.as_deref())
+        .unwrap()
+        .selection
+        .unwrap();
+    assert_eq!(legacy_mask.block_size, 1);
+    assert_eq!(legacy_mask.rects(129, 67).unwrap(), vec![R]);
+    for bpp in [24, 32] {
+        let src = fixture(129, -67, bpp);
+        let selection = GridSelection::from_regions(
+            129,
+            67,
+            1,
+            &[
+                Rect {
+                    x: 17,
+                    y: 19,
+                    width: 1,
+                    height: 1,
+                },
+                Rect {
+                    x: 35,
+                    y: 21,
+                    width: 7,
+                    height: 5,
+                },
+            ],
+        )
+        .unwrap();
+        for mode in [Mode::Alpha, Mode::Sidecar] {
+            let p = protect_grid(&src, "pixels", mode, &selection).unwrap();
+            let before = Bitmap::parse(src.clone()).unwrap().rgba();
+            let after = Bitmap::parse(p.bitmap.clone()).unwrap().rgba();
+            let mut changed = false;
+            for y in 0..67 {
+                for x in 0..129 {
+                    let i = (y * 129 + x) as usize;
+                    let selected = selection.bits[i / 8] & (1 << (i % 8)) != 0;
+                    if selected {
+                        changed |= before[i * 4..i * 4 + 3] != after[i * 4..i * 4 + 3];
+                    } else {
+                        assert_eq!(
+                            &before[i * 4..i * 4 + 3],
+                            &after[i * 4..i * 4 + 3],
+                            "unselected pixel ({x},{y}) changed"
+                        );
+                    }
+                }
+            }
+            assert!(changed);
+            let restored = restore(&p.bitmap, p.sidecar.as_deref(), "pixels").unwrap();
+            if mode == Mode::Alpha && bpp == 32 {
+                assert_eq!(Bitmap::parse(restored).unwrap().rgba(), before);
+            } else {
+                assert_eq!(restored, src);
+            }
+            assert_eq!(
+                inspect(&p.bitmap, p.sidecar.as_deref()).unwrap().selection,
+                Some(selection.clone())
+            );
+        }
+    }
+    assert!(mosaic_core::transform_grid(
+        &fixture(32, 32, 24),
+        "pw",
+        &GridSelection::empty(32, 32, 1).unwrap()
+    )
+    .is_err());
+}

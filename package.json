@@ -10,8 +10,9 @@
     "desktop": "tauri dev",
     "test": "cargo test -p mosaic-core",
     "check": "npm run build && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings",
-    "format": "prettier --write src index.html vite.config.ts tsconfig.json package.json src-tauri/*.json src-tauri/capabilities/*.json README.md docs .github/workflows",
-    "format:check": "prettier --check src index.html vite.config.ts tsconfig.json package.json src-tauri/*.json src-tauri/capabilities/*.json README.md docs .github/workflows"
+    "format": "prettier --write src index.html vite.config.ts tsconfig.json package.json src-tauri/*.json src-tauri/capabilities/*.json README.md docs .github/workflows tests",
+    "format:check": "prettier --check src index.html vite.config.ts tsconfig.json package.json src-tauri/*.json src-tauri/capabilities/*.json README.md docs .github/workflows tests",
+    "test:ui": "tsc src/grid.ts src/viewport.ts --outDir artifacts/test-ui --target ES2022 --module ESNext --moduleResolution bundler --strict && node --test tests/editor.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0"
