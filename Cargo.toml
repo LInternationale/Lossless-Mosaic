@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/mosaic-core", "src-tauri"]
+default-members = ["crates/mosaic-core"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[profile.release]
+lto = "thin"
+strip = true

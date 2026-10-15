@@ -1,0 +1,15 @@
+[package]
+name = "lossless-mosaic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+mosaic-core = { path = "../crates/mosaic-core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+zeroize = "1"
